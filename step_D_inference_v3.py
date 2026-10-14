@@ -171,31 +171,12 @@ from torchvision import models
 class PlaneEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        loaded = False
-        try:
-            from torchvision.models import efficientnet_b3
-            base = efficientnet_b3(weights=None)
-            old_conv = base.features[0][0]
-            base.features[0][0] = nn.Conv2d(
-                1, old_conv.out_channels,
-                kernel_size=old_conv.kernel_size,
-                stride=old_conv.stride,
-                padding=old_conv.padding,
-                bias=False
-            )
-            self.backbone = base.features
-            self.pool = base.avgpool
-            self.feat_dim = 1536
-            loaded = True
-        except Exception:
-            pass
-
-        if not loaded:
-            base = models.resnet34(weights=None)
-            base.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-            self.backbone = nn.Sequential(*list(base.children())[:-2])
-            self.pool = nn.AdaptiveAvgPool2d(1)
-            self.feat_dim = 512
+        base = models.resnet34(weights=None)
+        old_conv = base.conv1
+        base.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.backbone = nn.Sequential(*list(base.children())[:-2])
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.feat_dim = 512
 
     def forward(self, x):
         B, S, H, W = x.shape

@@ -3,10 +3,11 @@ RSNA Knee — Improvement Module C: GPU-Optimized Full Training (v3)
 OPTIMIZATIONS FOR DUAL T4 GPUs:
   1. Multi-GPU DataParallel: detects and utilizes ALL available GPUs (T4 x2)
   2. Mixed Precision Training (torch.cuda.amp): 2-3x speedup via Tensor Cores + 50% VRAM saving
-  3. Optimized DataLoader: num_workers=4, pin_memory=True, non_blocking=True
-  4. Dynamic Batch Sizing: scaled according to available GPUs (Batch Size 8 or 16)
-  5. Robust Pretrained Fallback: gracefully handles offline Kaggle kernel without crash
-  6. Focal Masked BCE Loss + Plane Attention Gate + OneCycleLR + Early Stopping
+  3. Optimized DataLoader: num_workers=2, pin_memory=True, non_blocking=True
+  4. Dynamic Batch Sizing: scaled according to available GPUs (Batch Size 16)
+  5. Multi-Plane Attention Fusion: dynamic cross-plane attention gates
+  6. Focal Masked BCE Loss + OneCycleLR + Early Stopping
+  7. Exact architecture synchronization with step_D_inference_v3
 """
 import os
 import time
@@ -17,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torchvision import models
 from sklearn.metrics import roc_auc_score
 
 warnings.filterwarnings('ignore')
@@ -39,7 +41,7 @@ for i in range(NUM_GPUS):
     print(f"  --> GPU {i}: {gpu_name} ({vram_gb:.1f} GB VRAM)")
 
 if DEVICE.type == 'cuda':
-    torch.backends.cudnn.benchmark = True  # Auto-tunes fastest convolution algorithms
+    torch.backends.cudnn.benchmark = True  # Auto-tune fastest convolution kernels
 
 # Batch size scales with GPU count
 BASE_BATCH = 8
@@ -68,7 +70,7 @@ elif os.path.exists(fallback_path):
 else:
     raise FileNotFoundError("No cache file found! Please execute step_B_cache_v2.py first.")
 
-sag_arr    = data['sag']     # (N, slices, 224, 224)
+sag_arr    = data['sag']     # (N, slices, 224, 224) uint8 or float32
 cor_arr    = data['cor']
 axi_arr    = data['axi']
 labels_arr = data['labels']  # (N, 12)
@@ -79,7 +81,6 @@ print(f"Total Studies in Cache: {N}")
 print(f"Slices per plane:       {N_SLICES}")
 print(f"Effective Batch Size:   {BATCH_SIZE} across {max(1, NUM_GPUS)} GPU(s)")
 
-# Count gold labeled studies
 gold_count = np.sum(np.all(labels_arr >= 0, axis=1))
 print(f"Gold Ground-Truth Studies: {gold_count}/{N}")
 
@@ -95,9 +96,9 @@ class KneeDatasetV3(Dataset):
         self.augment = augment
 
     def _aug(self, vol):
-        # vol: (slices, H, W)
+        # vol: (slices, H, W) float32 in [0, 1]
         if np.random.rand() < 0.5:
-            vol = vol[:, :, ::-1].copy()  # Horizontal flip (anatomically preserved)
+            vol = vol[:, :, ::-1].copy()  # Horizontal flip
         if np.random.rand() < 0.3:
             vol = vol[:, ::-1, :].copy()  # Vertical flip
         if np.random.rand() < 0.4:
@@ -116,7 +117,7 @@ class KneeDatasetV3(Dataset):
         cor = self.cor[idx].astype(np.float32)
         axi = self.axi[idx].astype(np.float32)
 
-        # Scale uint8 [0..255] to [0.0..1.0]
+        # Scale uint8 [0..255] to [0.0..1.0] float32
         if self.sag.dtype == np.uint8 or sag.max() > 1.0:
             sag = sag / 255.0
             cor = cor / 255.0
@@ -126,6 +127,7 @@ class KneeDatasetV3(Dataset):
             sag = self._aug(sag)
             cor = self._aug(cor)
             axi = self._aug(axi)
+
         return (
             torch.tensor(sag, dtype=torch.float32),
             torch.tensor(cor, dtype=torch.float32),
@@ -136,54 +138,31 @@ class KneeDatasetV3(Dataset):
 # -----------------------------------------------------------------------
 # 4. Multi-Plane Deep Neural Network with Attention Gates
 # -----------------------------------------------------------------------
-from torchvision import models
-
 class PlaneEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        # Try loading pretrained EfficientNet-B3; fallback gracefully if offline without cache
-        loaded = False
+        # Pretrained ResNet34 with 1-channel grayscale conv1
         try:
-            from torchvision.models import efficientnet_b3, EfficientNet_B3_Weights
-            base = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
-            old_conv = base.features[0][0]
-            base.features[0][0] = nn.Conv2d(
-                1, old_conv.out_channels,
-                kernel_size=old_conv.kernel_size,
-                stride=old_conv.stride,
-                padding=old_conv.padding,
-                bias=False
-            )
-            with torch.no_grad():
-                base.features[0][0].weight.copy_(old_conv.weight[:, :1, :, :])
-            self.backbone = base.features
-            self.pool = base.avgpool
-            self.feat_dim = 1536
-            loaded = True
+            base = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
         except Exception:
-            pass
+            base = models.resnet34(weights=None)
 
-        if not loaded:
-            # High-efficiency ResNet34 fallback
-            try:
-                base = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
-            except Exception:
-                base = models.resnet34(weights=None)
-            old_conv = base.conv1
-            base.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-            with torch.no_grad():
-                base.conv1.weight.copy_(old_conv.weight[:, :1, :, :])
-            self.backbone = nn.Sequential(*list(base.children())[:-2])
-            self.pool = nn.AdaptiveAvgPool2d(1)
-            self.feat_dim = 512
+        old_conv = base.conv1
+        base.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        with torch.no_grad():
+            base.conv1.weight.copy_(old_conv.weight[:, :1, :, :])
+
+        self.backbone = nn.Sequential(*list(base.children())[:-2])
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.feat_dim = 512
 
     def forward(self, x):
         # x: (B, S, H, W)
         B, S, H, W = x.shape
         x = x.view(B * S, 1, H, W)
-        feats = self.pool(self.backbone(x))  # (B*S, feat_dim, 1, 1)
+        feats = self.pool(self.backbone(x))   # (B*S, 512, 1, 1)
         feats = feats.view(B, S, self.feat_dim)
-        return feats.mean(dim=1)             # (B, feat_dim) pooled across slices
+        return feats.mean(dim=1)              # (B, 512) pooled across slices
 
 class MultiPlaneKneeNetV3(nn.Module):
     def __init__(self, num_classes=12):
@@ -211,11 +190,10 @@ class MultiPlaneKneeNetV3(nn.Module):
         )
 
     def forward(self, sag, cor, axi):
-        fs = self.sag_enc(sag)   # (B, feat_dim)
+        fs = self.sag_enc(sag)   # (B, 512)
         fc = self.cor_enc(cor)
         fa = self.axi_enc(axi)
 
-        # Cross-plane weighting
         all_feats = torch.cat([fs, fc, fa], dim=1)
         attn = self.plane_attn(all_feats) # (B, 3)
         fs = fs * attn[:, 0:1]
@@ -256,7 +234,7 @@ train_idx = pseudo_indices[val_pseudo_count:]
 
 print(f"\n[DATA SPLIT] Train: {len(train_idx)} studies | Validation: {len(val_idx)} studies (includes all {len(gold_indices)} gold)")
 
-num_workers = min(4, os.cpu_count() or 2)
+num_workers = 2  # Stable and optimal for Kaggle GPU environments
 train_ds = KneeDatasetV3(sag_arr[train_idx], cor_arr[train_idx], axi_arr[train_idx], labels_arr[train_idx], augment=True)
 val_ds   = KneeDatasetV3(sag_arr[val_idx], cor_arr[val_idx], axi_arr[val_idx], labels_arr[val_idx], augment=False)
 
@@ -340,7 +318,6 @@ for epoch in range(1, EPOCHS + 1):
 
             with torch.cuda.amp.autocast(enabled=(DEVICE.type == 'cuda')):
                 p1 = torch.sigmoid(model(sag, cor, axi))
-                # TTA horizontal flip
                 p2 = torch.sigmoid(model(sag.flip(-1), cor.flip(-1), axi.flip(-1)))
                 p_avg = (p1 + p2) * 0.5
 
@@ -373,7 +350,6 @@ for epoch in range(1, EPOCHS + 1):
     if mean_auc > best_auc:
         best_auc = mean_auc
         patience_counter = 0
-        # Unwrap DataParallel before saving weights
         weights = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
         torch.save(weights, save_path)
         star = " ★ [BEST]"
