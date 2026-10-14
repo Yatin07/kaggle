@@ -112,9 +112,16 @@ class KneeDatasetV3(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        sag = self.sag[idx].copy()
-        cor = self.cor[idx].copy()
-        axi = self.axi[idx].copy()
+        sag = self.sag[idx].astype(np.float32)
+        cor = self.cor[idx].astype(np.float32)
+        axi = self.axi[idx].astype(np.float32)
+
+        # Scale uint8 [0..255] to [0.0..1.0]
+        if self.sag.dtype == np.uint8 or sag.max() > 1.0:
+            sag = sag / 255.0
+            cor = cor / 255.0
+            axi = axi / 255.0
+
         if self.augment:
             sag = self._aug(sag)
             cor = self._aug(cor)
