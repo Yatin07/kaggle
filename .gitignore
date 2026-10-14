@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+venv/
+env/
+
+# Large ML Weights & Data
+*.pth
+*.pt
+*.bin
+*.h5
+*.npz
+*.npy
+*.dcm
+
+# Kaggle Large Data
+*.csv
+!sample_submission.csv
+!submission.csv
+input/
+output/
+working/
+
+# IDE / System
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

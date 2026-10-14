@@ -1,0 +1,11 @@
+# Roo Code & Roo Code Nightly GSD Rules for RSNA Knee Kaggle Competition
+
+## CRITICAL RULES
+1. **NO MASSIVE LOCAL DOWNLOADS:** The competition data is 570 GB. Never attempt to download raw MRI DICOM datasets to the local workspace. All image processing must run remotely in Kaggle Notebooks or be generated as small cached NumPy/PNG arrays.
+2. **DATA SECURITY:** Never paste patient reports or DICOM raw contents directly into external cloud prompts. Only share code, tabular summary statistics, metrics, and error logs.
+3. **FOLLOW THE GSD SPEC-DRIVEN PIPELINE:**
+   - Source of truth is located in `.planning/` (`SPEC.md`, `PLAN.md`, `STATE.md`).
+   - Work strictly according to the active Wave in `.planning/PLAN.md`.
+   - After completing each task/wave, update `.planning/STATE.md`.
+4. **OFFLINE CONSTRAINTS:** All Kaggle inference code must function with `Internet: OFF`. Pretrained weights must be attached via Kaggle Datasets/Models, not downloaded via `pip` or URLs.
+5. **BEAT CONTEXT ROT:** In Roo Code, once a wave or major task completes, start a **New Task (`+`)** to keep the context window fresh.
