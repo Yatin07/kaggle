@@ -1,10 +1,9 @@
 """
-RSNA Knee — Step B v4: 4-Core Parallel + GPU-Batched Cache (High Speed, <5GB RAM)
-WHY THIS IS 4X-5X FASTER:
-  - Uses all 4 Kaggle CPU cores (ThreadPoolExecutor over 32-study chunks) -> CPU jumps to 90-100%
-  - Batches 32 studies (224 slices) simultaneously through GPU -> GPU jumps to 60-80%
-  - Pre-allocated uint8 memory buffers -> RAM stays strictly under 5 GB (No OOM risk!)
-  - Speed: ~8-10 studies/second -> Finishes in ~7-8 minutes (instead of 38 minutes)
+RSNA Knee — Step B v5: High-Speed 4-Core + GPU Batched Cache (Robust Multi-Resolution)
+FIX:
+  Different hospital scanners have different resolutions (512x512, 768x768, 1024x1024).
+  Resizing to (224, 224) in the 4 CPU worker threads ensures all slices have identical dimensions
+  before GPU batching, completely eliminating "Sizes of tensors must match" errors.
 """
 import os
 import time
@@ -13,6 +12,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import pydicom
+import cv2
 import torch
 import torch.nn.functional as F
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 warnings.filterwarnings('ignore')
 
 print("=" * 70)
-print("RSNA Knee: Step B v4 — High-Speed 4-Core + GPU Batched Cache")
+print("RSNA Knee: Step B v5 — Multi-Resolution Safe High-Speed Cache")
 print("=" * 70)
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -32,10 +32,10 @@ if DEVICE.type == 'cuda':
 # -----------------------------------------------------------------------
 # CONFIG
 # -----------------------------------------------------------------------
-N_SLICES   = 7      # slices per plane
-IMG_SIZE   = 224    # 224x224 resolution
-CHUNK_SIZE = 32     # studies processed per batch (32 * 7 = 224 slices on GPU)
-NUM_THREADS = 4     # Kaggle has 4 CPU cores
+N_SLICES    = 7      # slices per plane
+IMG_SIZE    = 224    # 224x224 resolution
+CHUNK_SIZE  = 32     # studies per chunk (32 * 7 = 224 slices on GPU)
+NUM_THREADS = 4      # Kaggle 4 CPU cores
 
 TARGET_COLS = ['ACL', 'MCL', 'Medial Meniscus', 'Lateral Meniscus',
                'Medial OA', 'Lateral OA', 'PF OA', 'Effusion',
@@ -97,7 +97,7 @@ for i, (_, row) in enumerate(study_df.iterrows()):
     labels_arr[i] = [row.get(c, -1) for c in TARGET_COLS]
 
 # -----------------------------------------------------------------------
-# 4. Fast Parallel DICOM Reader for 1 Study (CPU Thread)
+# 4. Multi-Resolution Robust CPU Worker (Resizes each slice to 224x224)
 # -----------------------------------------------------------------------
 def read_raw_slices(study_id, plane):
     blank = [np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32) for _ in range(N_SLICES)]
@@ -119,13 +119,16 @@ def read_raw_slices(study_id, plane):
         try:
             dcm = pydicom.dcmread(files[idx], stop_before_pixels=False)
             arr = dcm.pixel_array.astype(np.float32)
+            # Harmonize varying MRI resolutions (512x512, 768x768, etc.) to 224x224
+            if arr.shape != (IMG_SIZE, IMG_SIZE):
+                arr = cv2.resize(arr, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
         except Exception:
             arr = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
         slices.append(arr)
     return slices
 
 def read_study_planes(study_id):
-    """Called by worker thread: reads all 3 planes for 1 study"""
+    """Parallel worker: loads all 3 planes for 1 study"""
     return (
         read_raw_slices(study_id, 'Sagittal'),
         read_raw_slices(study_id, 'Coronal'),
@@ -133,35 +136,27 @@ def read_study_planes(study_id):
     )
 
 # -----------------------------------------------------------------------
-# 5. Fast GPU Batch Processor (Processes multiple studies at once)
+# 5. Fast GPU Batch Normalization & Contrast Enhancement
 # -----------------------------------------------------------------------
 def process_chunk_on_gpu(plane_slices_list):
     """
-    plane_slices_list: list of length B (number of studies), each has N_SLICES 2D numpy arrays
-    Total slices to process: B * N_SLICES (e.g. 32 * 7 = 224 slices)
+    plane_slices_list: list of B studies, each containing N_SLICES 2D float32 arrays of size (224, 224)
     Returns: (B, N_SLICES, IMG_SIZE, IMG_SIZE) uint8 numpy array
     """
     B = len(plane_slices_list)
     flat_tensors = []
     for study_slices in plane_slices_list:
         for arr in study_slices:
-            if arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[1] < 2:
-                flat_tensors.append(torch.zeros(1, 1, IMG_SIZE, IMG_SIZE))
-            else:
-                flat_tensors.append(torch.from_numpy(arr).unsqueeze(0).unsqueeze(0))
+            flat_tensors.append(torch.from_numpy(arr).unsqueeze(0).unsqueeze(0))
 
     total_slices = len(flat_tensors)
-    batch_t = torch.cat(flat_tensors, dim=0).to(DEVICE)  # (total_slices, 1, H, W)
+    batch_t = torch.cat(flat_tensors, dim=0).to(DEVICE)  # Guaranteed uniform (total_slices, 1, 224, 224)
 
-    # Batched GPU Bilinear Resize
-    batch_resized = F.interpolate(batch_t, size=(IMG_SIZE, IMG_SIZE),
-                                  mode='bilinear', align_corners=False)
-
-    # Batched Min-Max Normalization
-    flat = batch_resized.view(total_slices, -1)
+    # Batched Min-Max Normalization on GPU
+    flat = batch_t.view(total_slices, -1)
     mins = flat.min(dim=1).values.view(total_slices, 1, 1, 1)
     maxs = flat.max(dim=1).values.view(total_slices, 1, 1, 1)
-    norm = (batch_resized - mins) / (maxs - mins + 1e-8)
+    norm = (batch_t - mins) / (maxs - mins + 1e-8)
 
     # Local tile contrast adjustment on GPU
     tile = IMG_SIZE // 4
@@ -177,7 +172,6 @@ def process_chunk_on_gpu(plane_slices_list):
 
     # Convert to uint8 directly on GPU before moving to CPU
     uint8_out = (norm.squeeze(1) * 255.0).clamp(0, 255).to(torch.uint8).cpu().numpy()
-    # Reshape back to (B, N_SLICES, IMG_SIZE, IMG_SIZE)
     return uint8_out.reshape(B, N_SLICES, IMG_SIZE, IMG_SIZE)
 
 # -----------------------------------------------------------------------
@@ -190,7 +184,7 @@ for start_idx in range(0, N, CHUNK_SIZE):
     end_idx = min(start_idx + CHUNK_SIZE, N)
     chunk_uids = uids_list[start_idx:end_idx]
 
-    # Step 1: Parallel I/O using all 4 CPU cores
+    # Parallel I/O using all 4 CPU cores
     with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
         chunk_results = list(executor.map(read_study_planes, chunk_uids))
 
@@ -198,12 +192,11 @@ for start_idx in range(0, N, CHUNK_SIZE):
     chunk_cor = [res[1] for res in chunk_results]
     chunk_axi = [res[2] for res in chunk_results]
 
-    # Step 2: GPU batch processing (224 slices per plane at once)
+    # GPU batch processing
     sag_arr[start_idx:end_idx] = process_chunk_on_gpu(chunk_sag)
     cor_arr[start_idx:end_idx] = process_chunk_on_gpu(chunk_cor)
     axi_arr[start_idx:end_idx] = process_chunk_on_gpu(chunk_axi)
 
-    # Periodic cleanup
     del chunk_results, chunk_sag, chunk_cor, chunk_axi
     if (end_idx % 200 < CHUNK_SIZE) or (end_idx == N):
         gc.collect()
@@ -233,7 +226,7 @@ np.savez_compressed(
 elapsed = time.time() - t0
 size_mb = os.path.getsize(cache_path) / (1024 ** 2)
 print("\n" + "=" * 70)
-print(f"[SUCCESS] High-Speed Cache saved: {cache_path}")
+print(f"[SUCCESS] Multi-Resolution Safe Cache saved: {cache_path}")
 print(f"Shape: ({N}, {N_SLICES}, {IMG_SIZE}, {IMG_SIZE}) uint8 per plane")
 print(f"File size on disk: {size_mb:.1f} MB")
 print(f"Total time: {elapsed:.0f}s (~{elapsed/60:.1f} minutes)")

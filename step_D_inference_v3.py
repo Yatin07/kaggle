@@ -110,10 +110,12 @@ def read_test_series_raw(study_id, plane):
     slices = []
     for idx in indices:
         try:
-            dcm = pydicom.dcmread(files[idx])
+            dcm = pydicom.dcmread(files[idx], stop_before_pixels=False)
             arr = dcm.pixel_array.astype(np.float32)
+            if arr.shape != (IMG_SIZE, IMG_SIZE):
+                arr = cv2.resize(arr, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
         except Exception:
-            arr = np.zeros((1, 1), dtype=np.float32)
+            arr = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
         slices.append(arr)
     return slices
 
