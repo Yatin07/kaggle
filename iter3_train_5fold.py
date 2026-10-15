@@ -8,6 +8,7 @@ KEY IMPROVEMENTS:
   4. Cross-Plane Attention Gate across Sagittal, Coronal, and Axial planes.
   5. Calibrated Fine-Tuning LR (1e-4) with Cosine Annealing.
   6. Positive Class-Weighted BCE Loss (handles rare pathologies like MCL and Fractures).
+  7. 100% Self-Contained: Inlines DICOM slice normal sorting (NO ModuleNotFoundError).
 """
 import os
 import time
@@ -23,8 +24,6 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import KFold
-
-from iter3_dicom_loader import load_series_volume
 
 warnings.filterwarnings('ignore')
 
@@ -43,22 +42,120 @@ TARGET_COLS = ['ACL', 'MCL', 'Medial Meniscus', 'Lateral Meniscus',
                'Synovitis', "Baker's", 'Contusion', 'Fracture']
 
 # -----------------------------------------------------------------------
-# 1. Dataset & Safe Augmentations (NO FLIPS)
+# 1. 3D DICOM Slice Normal Vector Sorter & Volume Loader (Inlined)
+# -----------------------------------------------------------------------
+def sort_series_slices(series_path):
+    """
+    Sorts DICOM slice files along their true physical anatomical axis
+    using the slice normal vector n = r x c, where r and c are the
+    row and column direction cosines from ImageOrientationPatient.
+    """
+    files = [os.path.join(series_path, f) for f in os.listdir(series_path) if f.endswith('.dcm')]
+    if not files:
+        return []
+
+    slice_positions = []
+    valid_files = []
+
+    for fpath in files:
+        try:
+            dcm = pydicom.dcmread(fpath, stop_before_pixels=True)
+            if hasattr(dcm, 'ImagePositionPatient') and hasattr(dcm, 'ImageOrientationPatient'):
+                iop = np.array(dcm.ImageOrientationPatient, dtype=float)
+                row_dir = iop[:3]
+                col_dir = iop[3:]
+                slice_normal = np.cross(row_dir, col_dir)
+                norm_len = np.linalg.norm(slice_normal)
+                if norm_len > 1e-6:
+                    slice_normal = slice_normal / norm_len
+                ipp = np.array(dcm.ImagePositionPatient, dtype=float)
+                pos = float(np.dot(ipp, slice_normal))
+            elif hasattr(dcm, 'InstanceNumber'):
+                pos = float(dcm.InstanceNumber)
+            else:
+                pos = 0.0
+            slice_positions.append(pos)
+            valid_files.append(fpath)
+        except Exception:
+            continue
+
+    if not valid_files:
+        return files
+
+    sorted_indices = np.argsort(slice_positions)
+    return [valid_files[idx] for idx in sorted_indices]
+
+
+def pad_to_square(img):
+    """Aspect-preserving letterbox padding to square (no squashing/distortion)."""
+    h, w = img.shape[:2]
+    if h == w:
+        return img
+    size = max(h, w)
+    pad_h = (size - h) // 2
+    pad_w = (size - w) // 2
+    padded = np.zeros((size, size), dtype=img.dtype)
+    padded[pad_h: pad_h + h, pad_w: pad_w + w] = img
+    return padded
+
+
+def load_series_volume(series_path, n_slices=7, target_size=224):
+    """Loads n_slices along true depth, per-series percentile window, padded to square."""
+    blank = np.zeros((n_slices, target_size, target_size), dtype=np.uint8)
+    if not os.path.exists(series_path):
+        return blank
+
+    sorted_files = sort_series_slices(series_path)
+    if not sorted_files:
+        return blank
+
+    indices = np.linspace(0, len(sorted_files) - 1, n_slices, dtype=int)
+    raw_slices = []
+
+    for idx in indices:
+        try:
+            dcm = pydicom.dcmread(sorted_files[idx], stop_before_pixels=False)
+            arr = dcm.pixel_array.astype(np.float32)
+
+            slope = getattr(dcm, 'RescaleSlope', 1.0)
+            intercept = getattr(dcm, 'RescaleIntercept', 0.0)
+            arr = arr * slope + intercept
+
+            if getattr(dcm, 'PhotometricInterpretation', '') == 'MONOCHROME1':
+                arr = np.max(arr) - arr
+
+            raw_slices.append(arr)
+        except Exception:
+            raw_slices.append(np.zeros((target_size, target_size), dtype=np.float32))
+
+    all_pixels = np.concatenate([s.flatten() for s in raw_slices])
+    p1 = np.percentile(all_pixels, 1.0)
+    p99 = np.percentile(all_pixels, 99.0)
+    if p99 <= p1:
+        p99 = p1 + 1.0
+
+    processed_slices = []
+    for s in raw_slices:
+        s_norm = np.clip((s - p1) / (p99 - p1), 0.0, 1.0) * 255.0
+        s_u8 = s_norm.astype(np.uint8)
+        s_square = pad_to_square(s_u8)
+        s_resized = cv2.resize(s_square, (target_size, target_size), interpolation=cv2.INTER_AREA)
+        processed_slices.append(s_resized)
+
+    return np.stack(processed_slices, axis=0)
+
+# -----------------------------------------------------------------------
+# 2. Dataset & Safe Augmentations (NO FLIPS)
 # -----------------------------------------------------------------------
 class KneeDatasetSafe(Dataset):
     def __init__(self, sag, cor, axi, labels, augment=False):
-        self.sag = sag       # (N, slices, H, W) uint8
+        self.sag = sag
         self.cor = cor
         self.axi = axi
-        self.labels = labels # (N, 12) float32
+        self.labels = labels
         self.augment = augment
 
     def _safe_aug(self, vol):
-        """
-        Safe spatial transforms that PRESERVE medial/lateral orientation:
-        Rotation (+-10 deg), translation (+-5%), scale (0.92-1.08), brightness (0.88-1.12).
-        FORBIDDEN: Horizontal flip, Vertical flip.
-        """
         slices, h, w = vol.shape
         angle = np.random.uniform(-10.0, 10.0)
         scale = np.random.uniform(0.92, 1.08)
@@ -99,7 +196,7 @@ class KneeDatasetSafe(Dataset):
         )
 
 # -----------------------------------------------------------------------
-# 2. Multi-Plane Model Architecture
+# 3. Multi-Plane Model Architecture
 # -----------------------------------------------------------------------
 class PlaneEncoder(nn.Module):
     def __init__(self):
@@ -164,7 +261,7 @@ class MultiPlaneKneeNetV3(nn.Module):
         return self.head(fused)
 
 # -----------------------------------------------------------------------
-# 3. 5-Fold Training Loop
+# 4. 5-Fold Training Loop
 # -----------------------------------------------------------------------
 def train_5fold(sag_arr, cor_arr, axi_arr, labels_arr, epochs=25, lr=1e-4, batch_size=8):
     N = len(labels_arr)
@@ -263,10 +360,9 @@ def train_5fold(sag_arr, cor_arr, axi_arr, labels_arr, epochs=25, lr=1e-4, batch
     return fold_aucs
 
 # -----------------------------------------------------------------------
-# 4. Main Execution: Extract Gold Volumes and Run 5-Fold Training
+# 5. Main Execution: Extract Gold Volumes and Run 5-Fold Training
 # -----------------------------------------------------------------------
 if __name__ == '__main__':
-    # Auto-detect competition directory
     comp_dir = None
     for root, dirs, files in os.walk('/kaggle/input'):
         if 'train.csv' in files:
@@ -276,11 +372,9 @@ if __name__ == '__main__':
     train_df = pd.read_csv(os.path.join(comp_dir, 'train.csv'))
     train_series_df = pd.read_csv(os.path.join(comp_dir, 'train_series.csv'))
 
-    # Filter to 58 clean gold annotations
     gold_df = train_df[train_df[TARGET_COLS].notna().all(axis=1)].reset_index(drop=True)
     print(f"Loaded {len(gold_df)} gold ground-truth studies for 5-fold cross-validation.")
 
-    # Build series map
     sort_cols = ['StudyInstanceUID', 'Anatomical_Plane']
     asc = [True, True]
     if 'Fluid_Sensitive' in train_series_df.columns:
@@ -295,7 +389,6 @@ if __name__ == '__main__':
             s_map[s] = {}
         s_map[s][row['Anatomical_Plane']] = row['SeriesInstanceUID']
 
-    # Extract 3D slice-normal volumes for the gold studies (~30 seconds)
     print("\n[EXTRACTING] Loading true 3D slice-normal volumes for gold studies...")
     gold_sag, gold_cor, gold_axi = [], [], []
 
