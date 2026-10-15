@@ -2,7 +2,7 @@
 RSNA Knee Abnormality Detection — Iteration 3 Research-Grade Training
 KEY IMPROVEMENTS:
   1. 5-Fold Stratified Cross-Validation on the 58 Gold Studies (Clean Out-Of-Fold Evaluation).
-  2. Safe Augmentations ONLY: Affine rotation (+-10 deg), translation (+-5%), scale (+-10%).
+  2. Safe Augmentations ONLY: Affine rotation (+-10 deg), translation (+-5%), scale (+-8%).
      ZERO Horizontal/Vertical Flips (strictly preserves Medial/Lateral and Femur/Tibia orientation).
   3. Pretrained ResNet34 with 1-channel Grayscale Conv1 + Slice Average Pooling.
   4. Cross-Plane Attention Gate across Sagittal, Coronal, and Axial planes.
@@ -12,8 +12,10 @@ KEY IMPROVEMENTS:
 import os
 import time
 import warnings
+import cv2
 import numpy as np
 import pandas as pd
+import pydicom
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,6 +23,8 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import KFold
+
+from iter3_dicom_loader import load_series_volume
 
 warnings.filterwarnings('ignore')
 
@@ -52,11 +56,10 @@ class KneeDatasetSafe(Dataset):
     def _safe_aug(self, vol):
         """
         Safe spatial transforms that PRESERVE medial/lateral orientation:
-        Rotation (+-10 deg), translation (+-5%), scale (0.9-1.1), brightness (0.85-1.15).
+        Rotation (+-10 deg), translation (+-5%), scale (0.92-1.08), brightness (0.88-1.12).
         FORBIDDEN: Horizontal flip, Vertical flip.
         """
         slices, h, w = vol.shape
-        # Random small rotation and scale
         angle = np.random.uniform(-10.0, 10.0)
         scale = np.random.uniform(0.92, 1.08)
         tx = np.random.uniform(-0.05, 0.05) * w
@@ -71,7 +74,6 @@ class KneeDatasetSafe(Dataset):
         for s in range(slices):
             aug_vol[s] = cv2.warpAffine(vol[s], M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
-        # Brightness / contrast jitter
         factor = np.random.uniform(0.88, 1.12)
         aug_vol = np.clip(aug_vol * factor, 0.0, 1.0)
         return aug_vol
@@ -80,7 +82,6 @@ class KneeDatasetSafe(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        # Convert uint8 [0..255] to float32 [0.0..1.0]
         sag = self.sag[idx].astype(np.float32) / 255.0
         cor = self.cor[idx].astype(np.float32) / 255.0
         axi = self.axi[idx].astype(np.float32) / 255.0
@@ -120,9 +121,9 @@ class PlaneEncoder(nn.Module):
     def forward(self, x):
         B, S, H, W = x.shape
         x = x.view(B * S, 1, H, W)
-        feats = self.pool(self.backbone(x))   # (B*S, 512, 1, 1)
+        feats = self.pool(self.backbone(x))
         feats = feats.view(B, S, self.feat_dim)
-        return feats.mean(dim=1)              # (B, 512)
+        return feats.mean(dim=1)
 
 class MultiPlaneKneeNetV3(nn.Module):
     def __init__(self, num_classes=12):
@@ -130,11 +131,10 @@ class MultiPlaneKneeNetV3(nn.Module):
         self.sag_enc = PlaneEncoder()
         self.cor_enc = PlaneEncoder()
         self.axi_enc = PlaneEncoder()
-        feat_dim = self.sag_enc.feat_dim
+        fd = self.sag_enc.feat_dim
 
-        # Cross-plane dynamic attention gate
         self.plane_attn = nn.Sequential(
-            nn.Linear(feat_dim * 3, 128),
+            nn.Linear(fd * 3, 128),
             nn.GELU(),
             nn.Linear(128, 3),
             nn.Softmax(dim=-1)
@@ -142,7 +142,7 @@ class MultiPlaneKneeNetV3(nn.Module):
 
         self.head = nn.Sequential(
             nn.Dropout(0.4),
-            nn.Linear(feat_dim * 3, 512),
+            nn.Linear(fd * 3, 512),
             nn.LayerNorm(512),
             nn.GELU(),
             nn.Dropout(0.3),
@@ -166,16 +166,10 @@ class MultiPlaneKneeNetV3(nn.Module):
 # -----------------------------------------------------------------------
 # 3. 5-Fold Training Loop
 # -----------------------------------------------------------------------
-def train_5fold(sag_arr, cor_arr, axi_arr, labels_arr, epochs=20, lr=1e-4, batch_size=8):
-    """
-    Trains a 5-fold ensemble with out-of-fold validation on the gold annotations.
-    """
+def train_5fold(sag_arr, cor_arr, axi_arr, labels_arr, epochs=25, lr=1e-4, batch_size=8):
     N = len(labels_arr)
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    oof_predictions = np.zeros_like(labels_arr)
-    oof_targets = np.zeros_like(labels_arr)
 
-    # Class positive weights for BCE
     pos_counts = (labels_arr == 1).sum(axis=0)
     neg_counts = (labels_arr == 0).sum(axis=0)
     pos_weight = torch.tensor(
@@ -187,9 +181,9 @@ def train_5fold(sag_arr, cor_arr, axi_arr, labels_arr, epochs=20, lr=1e-4, batch
     fold_aucs = []
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(np.arange(N))):
-        print(f"\n" + "-" * 50)
-        print(f"FOLD {fold + 1} / 5 | Train: {len(train_idx)} | Val: {len(val_idx)}")
-        print("-" * 50)
+        print(f"\n" + "-" * 55)
+        print(f"FOLD {fold + 1} / 5 | Train Cases: {len(train_idx)} | Val Cases: {len(val_idx)}")
+        print("-" * 55)
 
         train_ds = KneeDatasetSafe(sag_arr[train_idx], cor_arr[train_idx], axi_arr[train_idx], labels_arr[train_idx], augment=True)
         val_ds   = KneeDatasetSafe(sag_arr[val_idx], cor_arr[val_idx], axi_arr[val_idx], labels_arr[val_idx], augment=False)
@@ -264,6 +258,66 @@ def train_5fold(sag_arr, cor_arr, axi_arr, labels_arr, epochs=20, lr=1e-4, batch
     print(f"5-FOLD CROSS-VALIDATION SUMMARY:")
     for f_idx, auc in enumerate(fold_aucs):
         print(f"  Fold {f_idx + 1}: AUC = {auc:.4f}")
-    print(f"MEAN 5-FOLD MACRO ROC-AUC: {mean_oof_auc:.4f}")
+    print(f"MEAN 5-FOLD OUT-OF-FOLD ROC-AUC: {mean_oof_auc:.4f}")
     print("=" * 70)
     return fold_aucs
+
+# -----------------------------------------------------------------------
+# 4. Main Execution: Extract Gold Volumes and Run 5-Fold Training
+# -----------------------------------------------------------------------
+if __name__ == '__main__':
+    # Auto-detect competition directory
+    comp_dir = None
+    for root, dirs, files in os.walk('/kaggle/input'):
+        if 'train.csv' in files:
+            comp_dir = root
+            break
+
+    train_df = pd.read_csv(os.path.join(comp_dir, 'train.csv'))
+    train_series_df = pd.read_csv(os.path.join(comp_dir, 'train_series.csv'))
+
+    # Filter to 58 clean gold annotations
+    gold_df = train_df[train_df[TARGET_COLS].notna().all(axis=1)].reset_index(drop=True)
+    print(f"Loaded {len(gold_df)} gold ground-truth studies for 5-fold cross-validation.")
+
+    # Build series map
+    sort_cols = ['StudyInstanceUID', 'Anatomical_Plane']
+    asc = [True, True]
+    if 'Fluid_Sensitive' in train_series_df.columns:
+        sort_cols.append('Fluid_Sensitive'); asc.append(False)
+    if 'Fat_Suppression' in train_series_df.columns:
+        sort_cols.append('Fat_Suppression'); asc.append(False)
+    sel = train_series_df.sort_values(sort_cols, ascending=asc).drop_duplicates(subset=['StudyInstanceUID', 'Anatomical_Plane'])
+    s_map = {}
+    for _, row in sel.iterrows():
+        s = row['StudyInstanceUID']
+        if s not in s_map:
+            s_map[s] = {}
+        s_map[s][row['Anatomical_Plane']] = row['SeriesInstanceUID']
+
+    # Extract 3D slice-normal volumes for the gold studies (~30 seconds)
+    print("\n[EXTRACTING] Loading true 3D slice-normal volumes for gold studies...")
+    gold_sag, gold_cor, gold_axi = [], [], []
+
+    def get_vol(sid, plane):
+        if sid not in s_map or plane not in s_map[sid]:
+            return np.zeros((7, 224, 224), dtype=np.uint8)
+        s_id = s_map[sid][plane]
+        p = os.path.join(comp_dir, 'train_series', str(sid), str(s_id))
+        return load_series_volume(p, n_slices=7, target_size=224)
+
+    t0 = time.time()
+    for idx, sid in enumerate(gold_df['StudyInstanceUID']):
+        gold_sag.append(get_vol(sid, 'Sagittal'))
+        gold_cor.append(get_vol(sid, 'Coronal'))
+        gold_axi.append(get_vol(sid, 'Axial'))
+        if (idx + 1) % 15 == 0 or (idx + 1) == len(gold_df):
+            print(f"  Processed {idx + 1}/{len(gold_df)} gold studies ({time.time() - t0:.1f}s)")
+
+    gold_sag = np.array(gold_sag, dtype=np.uint8)
+    gold_cor = np.array(gold_cor, dtype=np.uint8)
+    gold_axi = np.array(gold_axi, dtype=np.uint8)
+    gold_labels = gold_df[TARGET_COLS].values.astype(np.float32)
+
+    # Launch 5-Fold Training
+    train_5fold(gold_sag, gold_cor, gold_axi, gold_labels, epochs=25, lr=1e-4, batch_size=8)
