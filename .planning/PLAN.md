@@ -53,11 +53,39 @@
   </task>
 </wave>
 
-<wave id="5" name="Wave 5: Offline Test Inference & Submission" status="in_progress">
-  <script>wave5_inference.py</script>
-  <task id="5.1" status="pending">
-    <title>Zero-Internet Test Set Prediction</title>
-    <description>Load best model weights, predict on test_series, blend with empirical priors, and write submission.csv.</description>
-    <verification>Final submission.csv created under Kaggle 9-hour runtime limit.</verification>
+<wave id="5" name="Wave 5: Iteration 3 — 5-Fold Gold Ensemble Inference" status="completed">
+  <script>iter3_inference_ensemble.py</script>
+  <task id="5.1" status="completed">
+    <title>3D Slice-Normal 5-Fold Ensemble Submission</title>
+    <description>Load 5 saved fold weights, predict across all 3 planes, blend with empirical priors, and write submission.csv in under 30 seconds.</description>
+    <verification>Verified: submission.csv generated (3x13, 0 nulls) and submitted via Quick Save.</verification>
   </task>
 </wave>
+
+<wave id="6" name="Wave 6: Iteration 4 — SOTA 4-Model Ensemble Deployment" status="in_progress">
+  <script>iter4_sota_v33_inference.py</script>
+  <task id="6.1" status="in_progress">
+    <title>Deploy V33 4-Model Ensemble in Kaggle</title>
+    <description>Attach 4 external weights datasets, configure Dual T4 GPUs, execute Raptor-384, Raptor-224 (mirror mix), R7 ConvNeXt, and S6 ConvNeXt.</description>
+    <verification>Target: Establish 0.957+ Public Leaderboard benchmark.</verification>
+  </task>
+</wave>
+
+<wave id="7" name="Wave 7: Iteration 4 — Custom 2.5D MIL CoAtNet Training" status="pending">
+  <script>iter4_train_custom_mil.py</script>
+  <task id="7.1" status="pending">
+    <title>Train Custom Model on Validated Soft Pseudo-Labels</title>
+    <description>Train on all 4,407 studies using continuous LLM soft targets and finding-specific multi-instance attention.</description>
+    <verification>Target: OOF Macro ROC-AUC > 0.92 on the 58 gold evaluation set.</verification>
+  </task>
+</wave>
+
+<wave id="8" name="Wave 8: Final 5-Way Rank Ensembling & Submission Freeze" status="pending">
+  <script>iter4_final_blend.py</script>
+  <task id="8.1" status="pending">
+    <title>Final 5-Way Percentile Rank Blend</title>
+    <description>Combine 4-model community ensemble with custom 3D normal model for maximum diversity before Oct 22 deadline.</description>
+    <verification>Target: Final competition submission scoring 0.960+.</verification>
+  </task>
+</wave>
+
